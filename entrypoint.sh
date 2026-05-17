@@ -1,33 +1,71 @@
 #!/bin/bash
 set -e
 
-# Очистка старых данных PostgreSQL
-rm -rf /var/lib/postgresql/data/* 2>/dev/null || true
+# Создаём директорию данных с правильными правами
 mkdir -p /var/lib/postgresql/data
 chown -R postgres:postgres /var/lib/postgresql
+chmod 0700 /var/lib/postgresql/data
 
-# Очистка etcd
-rm -rf /var/lib/etcd/* 2>/dev/null || true
-mkdir -p /var/lib/etcd
+# Очистка старых данных только если нет PG_VERSION
+if [ ! -f /var/lib/postgresql/data/PG_VERSION ]; then
+    rm -rf /var/lib/postgresql/data/* 2>/dev/null || true
+fi
 
-# Запуск etcd от root
-/usr/local/bin/etcd --name etcd \
-  --data-dir /var/lib/etcd \
-  --listen-client-urls http://0.0.0.0:2379 \
-  --advertise-client-urls http://127.0.0.1:2379 \
-  --listen-peer-urls http://0.0.0.0:2380 \
-  --initial-advertise-peer-urls http://127.0.0.1:2380 \
-  --initial-cluster etcd=http://127.0.0.1:2380 \
-  --initial-cluster-state new \
-  --enable-v2=true > /var/log/etcd.log 2>&1 &
+# Создаём YAML-файл из переменных окружения
+cat > /tmp/patroni.yml << EOF
+scope: postgres-cluster
+name: ${PATRONI_NAME}
 
-# Ждём etcd
-echo "Waiting for etcd..."
-for i in 1 2 3 4 5 6 7 8 9 10; do
-  sleep 1
-  curl -s http://127.0.0.1:2379/health && break
-done
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: ${PATRONI_NAME}:8008
 
-# Запуск Patroni от пользователя postgres
-echo "Starting Patroni as postgres user..."
-su - postgres -c "/opt/patroni-venv/bin/patroni /etc/patroni.yml"
+etcd:
+  hosts: etcd:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_connections: 100
+        max_wal_senders: 5
+        wal_keep_size: 64
+        max_replication_slots: 5
+        archive_mode: "on"
+        archive_timeout: 1800
+  initdb:
+  - auth-host: md5
+  - auth-local: trust
+  pg_hba:
+  - host replication replicator 0.0.0.0/0 md5
+  - host all all 0.0.0.0/0 md5
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: ${PATRONI_NAME}:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/lib/postgresql/17/bin
+  authentication:
+    replication:
+      username: replicator
+      password: replpass
+    superuser:
+      username: postgres
+      password: postgres
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
+EOF
+
+# Запуск Patroni
+su - postgres -c "/opt/patroni-venv/bin/patroni /tmp/patroni.yml"
